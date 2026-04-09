@@ -1,0 +1,13 @@
+kitti_raw/
+kitti_processed/
+experiments/
+infer_output/
+runs/
+vis_output/
+checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+eval_results.npz
