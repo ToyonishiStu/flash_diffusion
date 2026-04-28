@@ -36,12 +36,27 @@ def plot_range_image_comparison(input_img, pred_img, target_img, mask,
     print(f"Saved: {save_path}")
 
 
-def plot_bev(pred_pts, gt_pts, save_path: str = "vis_bev.png"):
-    """Bird's eye view: XY scatter colored by Z."""
-    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+def plot_bev(pred_pts, gt_pts, save_path: str = "vis_bev.png", input_pts=None):
+    """Bird's eye view: XY scatter colored by Z.
 
-    for ax, pts, title in [(axes[0], gt_pts, "Ground Truth"),
-                            (axes[1], pred_pts, "Prediction")]:
+    If input_pts is provided, shows 3 panels: Input (16-beam bilinear) | GT | Prediction.
+    Otherwise shows 2 panels: GT | Prediction (backward compatible).
+    """
+    if input_pts is not None:
+        panels = [
+            (input_pts, "Input (16-beam bilinear)"),
+            (gt_pts,    "Ground Truth"),
+            (pred_pts,  "Prediction"),
+        ]
+        fig, axes = plt.subplots(1, 3, figsize=(27, 8))
+    else:
+        panels = [
+            (gt_pts,   "Ground Truth"),
+            (pred_pts, "Prediction"),
+        ]
+        fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+
+    for ax, (pts, title) in zip(axes, panels):
         if len(pts) > 50000:
             idx = np.random.choice(len(pts), 50000, replace=False)
             pts = pts[idx]
@@ -132,9 +147,10 @@ def visualize_frames(checkpoint_path: str, config: Config = None,
         )
 
         # BEV
-        pred_pts = range_image_to_points(pred_np, mask, config)
-        gt_pts = range_image_to_points(target, mask, config)
-        plot_bev(pred_pts, gt_pts,
+        pred_pts  = range_image_to_points(pred_np,  mask, config)
+        gt_pts    = range_image_to_points(target,   mask, config)
+        input_pts = range_image_to_points(input_np, mask, config)
+        plot_bev(pred_pts, gt_pts, input_pts=input_pts,
                  save_path=os.path.join(output_dir, f"bev_{i:03d}.png"))
 
         # Error histogram
