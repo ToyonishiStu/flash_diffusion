@@ -53,10 +53,12 @@ done
 # ---------------------------------------------------------------------------
 if [ "$MODE" = "dev" ]; then
     DEV_FLAG="--dev"
+    NUM_EPOCHS=10
     VIS_FRAMES="${VIS_FRAMES:-3}"
     echo "=== DEV MODE (10 epochs, batch=1, vis_frames=${VIS_FRAMES}) ==="
 else
     DEV_FLAG=""
+    NUM_EPOCHS=600
     VIS_FRAMES="${VIS_FRAMES:-5}"
     echo "=== FULL MODE (600 epochs, batch=8, vis_frames=${VIS_FRAMES}) ==="
 fi
@@ -65,6 +67,33 @@ fi
 # ユーティリティ
 # ---------------------------------------------------------------------------
 timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
+
+# チェックポイントディレクトリを検査し、train.py に渡す引数を返す
+# 引数: $1=ckpt_dir, $2=num_epochs
+# 標準出力:
+#   "skip"           → 学習完了済み（スキップ）
+#   ""（空文字）      → 新規学習
+#   "--resume PATH"  → 途中から再開
+get_train_resume_arg() {
+    local ckpt_dir="$1"
+    local num_epochs="$2"
+
+    [ ! -d "$ckpt_dir" ] && echo "" && return
+
+    local latest_ckpt
+    latest_ckpt=$(find "$ckpt_dir" -name "epoch_*.pt" 2>/dev/null | sort | tail -1)
+
+    [ -z "$latest_ckpt" ] && echo "" && return
+
+    local epoch_num
+    epoch_num=$((10#$(basename "$latest_ckpt" | sed 's/epoch_\([0-9]*\)\.pt/\1/')))
+
+    if [ "$epoch_num" -ge "$num_epochs" ]; then
+        echo "skip"
+    else
+        echo "--resume $latest_ckpt"
+    fi
+}
 
 section() {
     echo ""
@@ -96,7 +125,30 @@ fi
 if [ "$SKIP_TRAIN" = false ]; then
     section "Step 1/6: アブレーション学習 (4バリアント)"
     echo "  baseline (FLASH), +RAFK, +MKDisc, proposed (FLASH+)"
-    python run_ablation.py $DEV_FLAG --skip_eval --base_dir experiments
+
+    for VARIANT in baseline rafk mkdisc proposed; do
+        CKPT_DIR="experiments/${VARIANT}/checkpoints"
+        LOG_DIR="experiments/${VARIANT}/runs"
+
+        RESUME_ARG=$(get_train_resume_arg "$CKPT_DIR" "$NUM_EPOCHS")
+
+        if [ "$RESUME_ARG" = "skip" ]; then
+            echo ">>> ${VARIANT}: 学習完了済み (${NUM_EPOCHS}エポック) → スキップ"
+            continue
+        elif [ -n "$RESUME_ARG" ]; then
+            RESUME_EPOCH=$((10#$(basename "$(echo "$RESUME_ARG" | awk '{print $2}')" | sed 's/epoch_\([0-9]*\)\.pt/\1/')))
+            echo ">>> ${VARIANT}: エポック ${RESUME_EPOCH} から再開..."
+        else
+            echo ">>> ${VARIANT}: 新規学習..."
+        fi
+
+        python train.py \
+            --variant "$VARIANT" \
+            --checkpoint_dir "$CKPT_DIR" \
+            --log_dir "$LOG_DIR" \
+            $DEV_FLAG \
+            $RESUME_ARG
+    done
 else
     section "Step 1/6: アブレーション学習 スキップ"
     echo ">>> --skip-train が指定されたため学習をスキップします"
