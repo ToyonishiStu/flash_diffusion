@@ -46,10 +46,10 @@ class FrequencyAwareAttention(nn.Module):
         relative_position_index = relative_coords.sum(-1)  # (N, N)
         self.register_buffer("relative_position_index", relative_position_index)
 
-        # FFT branch
+        # FFT branch (FLASH paper Eq.(7): Conv2d on amplitude → sigmoid mask)
         if use_rafk:
-            self.conv_near = nn.Linear(dim, dim)
-            self.conv_far = nn.Linear(dim, dim)
+            self.conv_near = nn.Conv2d(1, 1, kernel_size=3, padding=1)
+            self.conv_far = nn.Conv2d(1, 1, kernel_size=3, padding=1)
             self.rafk_mlp = nn.Sequential(
                 nn.Linear(3, rafk_mlp_hidden),
                 nn.ReLU(inplace=True),
@@ -57,7 +57,7 @@ class FrequencyAwareAttention(nn.Module):
                 nn.Sigmoid(),
             )
         else:
-            self.fft_linear = nn.Linear(dim, dim)
+            self.freq_conv = nn.Conv2d(1, 1, kernel_size=3, padding=1)
 
         # Learnable fusion weight
         self.alpha = nn.Parameter(torch.tensor(alpha_init))
@@ -92,47 +92,40 @@ class FrequencyAwareAttention(nn.Module):
         out = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         return out
 
-    def _apply_freq_filter(self, x_fft_flat: torch.Tensor, shape: tuple,
-                           C: int, linear: nn.Linear) -> torch.Tensor:
-        """Apply a linear filter in frequency domain."""
-        x = x_fft_flat.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B_*h*w_fft*2, C)
-        x = linear(x)
-        x = x.view(shape[0], shape[2], shape[3], shape[4], C)
-        x = x.permute(0, 4, 1, 2, 3)  # (B_, C, h, w_fft, 2)
-        return x
-
     @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def fft_branch(self, x: torch.Tensor, window_feats: torch.Tensor = None) -> torch.Tensor:
-        """FFT-based frequency processing within windows.
+        """FFT branch per FLASH paper Eqs. (6)-(9).
         Args:
             x: (num_windows*B, N, C) where N = wh*ww
             window_feats: (num_windows*B, 3) per-window range features (RAFK only)
         Note: Decorated with custom_fwd to force float32, avoiding ComplexHalf issues.
         """
         B_, N, C = x.shape
-        # Reshape to spatial window layout for 2D FFT
-        x_2d = x.view(B_, self.window_h, self.window_w, C)
-        x_2d = x_2d.permute(0, 3, 1, 2)  # (B_, C, wh, ww)
+        wh, ww = self.window_h, self.window_w
 
-        # 2D FFT
-        x_fft = torch.fft.rfft2(x_2d, norm="ortho")
-        x_fft_flat = torch.view_as_real(x_fft)  # (..., 2)
-        shape = x_fft_flat.shape
+        # Eq.(6): channel-mean → 2D FFT (1 channel)
+        x_mean = x.view(B_, wh, ww, C).mean(dim=-1)        # (B_, wh, ww)
+        x_fft = torch.fft.rfft2(x_mean, norm="ortho")       # (B_, wh, ww//2+1) complex
+
+        # Eq.(7): amplitude → Conv2d → sigmoid (multiplicative mask)
+        amp = x_fft.abs().unsqueeze(1)                      # (B_, 1, wh, ww//2+1)
 
         if self.use_rafk and window_feats is not None:
-            # RAFK: blend near/far filters based on range features
-            out_near = self._apply_freq_filter(x_fft_flat, shape, C, self.conv_near)
-            out_far = self._apply_freq_filter(x_fft_flat, shape, C, self.conv_far)
-            alpha_blend = self.rafk_mlp(window_feats)  # (B_, 1)
-            alpha_blend = alpha_blend.view(B_, 1, 1, 1, 1)  # broadcast
-            x_fft_flat = (1.0 - alpha_blend) * out_near + alpha_blend * out_far
+            F_near = torch.sigmoid(self.conv_near(amp)).squeeze(1)   # (B_, wh, ww//2+1)
+            F_far = torch.sigmoid(self.conv_far(amp)).squeeze(1)     # (B_, wh, ww//2+1)
+            alpha_b = self.rafk_mlp(window_feats).view(B_, 1, 1)     # (B_, 1, 1)
+            # α=0 → conv_near dominant (near range), α=1 → conv_far dominant (far range)
+            F_attn = (1.0 - alpha_b) * F_near + alpha_b * F_far
         else:
-            x_fft_flat = self._apply_freq_filter(x_fft_flat, shape, C, self.fft_linear)
+            F_attn = torch.sigmoid(self.freq_conv(amp)).squeeze(1)   # (B_, wh, ww//2+1)
 
-        x_fft_out = torch.view_as_complex(x_fft_flat.contiguous())
-        x_out = torch.fft.irfft2(x_fft_out, s=(self.window_h, self.window_w), norm="ortho")
-        x_out = x_out.permute(0, 2, 3, 1).reshape(B_, N, C)  # (B_, N, C)
-        return x_out
+        # Eq.(8): freq coefficients × attention mask → inverse FFT
+        x_fft_out = x_fft * F_attn                                   # complex × real
+        x_spatial = torch.fft.irfft2(x_fft_out, s=(wh, ww), norm="ortho")  # (B_, wh, ww)
+
+        # Eq.(9): 1ch → C ch broadcast (view-only expand; gradients summed across C)
+        x_out = x_spatial.unsqueeze(-1).expand(-1, -1, -1, C)        # (B_, wh, ww, C)
+        return x_out.reshape(B_, N, C)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None,
                 window_feats: torch.Tensor = None) -> torch.Tensor:
@@ -154,7 +147,7 @@ class FrequencyAwareAttention(nn.Module):
         return out
 
     def get_rafk_weight_pairs(self):
-        """Return list of (W_near, W_far) weight pairs for freq_consistency loss."""
+        """Return list of (W_near, W_far) Conv2d weight pairs. Shape: (1, 1, 3, 3)."""
         if self.use_rafk:
             return [(self.conv_near.weight, self.conv_far.weight)]
         return []
